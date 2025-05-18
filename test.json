@@ -1,0 +1,56 @@
+[
+    {
+      "postgresReportId": "pg_test_cuid_001",
+      "mongoDocId": "mongo_test_oid_001",
+      "title": "Test Case 1: Flood in Da Nang",
+      "description": "Heavy rainfall causing street flooding in downtown Da Nang, near Han River.",
+      "incidentType": "FLOOD",
+      "severity": "MEDIUM",
+      "incidentTimestamp": "2025-05-18T08:00:00Z", 
+      "latitude": 16.0678,
+      "longitude": 108.2208,
+      "city": "Da Nang",
+      "country": "Vietnam",
+      "address": "Bach Dang Street, Da Nang",
+      "media": [
+        {
+          "type": "IMAGE",
+          "url": "https://example.com/media/danang_flood_test.jpg",
+          "caption": "Street flooding"
+        }
+      ],
+      "reporterUserId": 101
+    },
+    {
+      "postgresReportId": "pg_test_cuid_002",
+      "mongoDocId": "mongo_test_oid_002",
+      "title": "Test Case 2: Earthquake in Mandalay",
+      "description": "A strong earthquake was reported by multiple sources in Mandalay, Myanmar. Awaiting details on impact.",
+      "incidentType": "EARTHQUAKE",
+      "severity": "HIGH",
+      "incidentTimestamp": "2025-03-28T10:00:00Z",
+      "latitude": 21.9588,
+      "longitude": 96.0891,
+      "city": "Mandalay",
+      "country": "Myanmar",
+      "address": "Central Mandalay area",
+      "media": [],
+      "reporterUserId": 102
+    },
+    {
+      "postgresReportId": "pg_test_cuid_003",
+      "mongoDocId": "mongo_test_oid_003",
+      "title": "Test Case 3: Wildfire near National Park",
+      "description": "Smoke reported, possible wildfire near the Ba Vi National Park outskirts.",
+      "incidentType": "FIRE",
+      "severity": "MEDIUM",
+      "incidentTimestamp": "2025-05-17T14:30:00Z", 
+      "latitude": 21.0765,  
+      "longitude": 105.3681,
+      "city": "Hanoi", 
+      "country": "Vietnam",
+      "address": "Outskirts of Ba Vi National Park",
+      "media": [],
+      "reporterUserId": 103
+    }
+  ]
