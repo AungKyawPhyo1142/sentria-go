@@ -1,0 +1,77 @@
+# .air.toml - Configuration for Air live-reloader for the Sentria Fact-Checker Go service
+
+# Working directory for Air. '.' means the directory where .air.toml is located.
+root = "."
+# Directory for temporary files, like the compiled binary. Air will create this.
+# It's a good idea to add "tmp/" to your .gitignore file.
+tmp_dir = "tmp"
+
+[build]
+# This is the command Air will run to build your Go application.
+# It should point to your main package.
+cmd = "go build -o ./tmp/factchecker-api ./cmd/factchecker-api/main.go"
+
+# The binary file produced by the `cmd` above. Air will execute this.
+bin = "tmp/factchecker-api"
+
+# The full command Air will use to run your application.
+# You can set environment variables here that will be specific to when Air runs your app.
+# This is very useful for development-specific settings.
+# Adjust FACTCHECKER_SERVER_PORT if you use a different default in your config.go or want to override.
+full_bin = "FACTCHECKER_SERVER_PORT=8081 GIN_MODE=debug ./tmp/factchecker-api"
+
+# File extensions that Air should watch for changes.
+# Add any other file types you might edit that should trigger a rebuild (e.g., .json configs if loaded directly).
+include_ext = ["go", "env"] # Watching .env files can be useful if your app loads them directly
+
+# Directories to ignore. Air won't watch for changes in these.
+exclude_dir = ["assets", "tmp", "vendor", "docs", "node_modules"] # Added node_modules just in case
+
+# Specific files to ignore.
+exclude_file = []
+
+# Regular expressions for filenames to ignore.
+# Useful for ignoring generated files or specific test files if they cause issues with reload.
+exclude_regex = ["_test.go"]
+
+# If true, Air will not rebuild if only files listed in `exclude_file`
+# or matching `exclude_regex` change.
+exclude_unchanged = false
+
+# Follow symlinks for directories.
+follow_symlink = true
+
+# Log file for Air's build and run output (will be placed within tmp_dir).
+log = "air_errors.log" # Changed name slightly for clarity
+
+# Delay in milliseconds after a file change before Air triggers a rebuild.
+# This helps prevent multiple rebuilds if you're saving files rapidly.
+delay = 1000 # 1 second
+
+# If true, Air will stop the running old binary when build errors occur.
+stop_on_error = true
+
+# Send an Interrupt signal (SIGINT) before killing the process.
+# This allows for graceful shutdown if your app handles SIGINT.
+# Set to false for Windows if it causes issues.
+send_interrupt = true # Good for macOS/Linux
+
+# Kill delay in milliseconds if the process doesn't stop after an interrupt.
+kill_delay = 500 # 0.5 seconds
+
+[log]
+# Show timestamps in Air's own log output.
+time = true
+# Set to true if you want to see less of Air's own logs and more of your app's logs.
+# main_only = false
+
+[color]
+# Customize colors for different parts of Air's output.
+main = "magenta"    # Your application's output
+watcher = "cyan"    # Air's file watching messages
+build = "yellow"    # Air's build messages
+runner = "green"    # Air's messages about running the binary
+
+[misc]
+# Delete the tmp_dir (containing the compiled binary and logs) when Air exits.
+clean_on_exit = true
