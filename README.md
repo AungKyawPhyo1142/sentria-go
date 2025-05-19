@@ -27,8 +27,8 @@ To build and run this service, you will need:
 
 1.  **Clone the Repository (if you haven't already):**
     ```bash
-    # git clone https://github.com/AungKyawPhyo1142/sentria-go
-    # cd sentria-go
+        git clone https://github.com/AungKyawPhyo1142/sentria-go
+        cd sentria-go
     ```
 
 2.  **Environment Variables:**
