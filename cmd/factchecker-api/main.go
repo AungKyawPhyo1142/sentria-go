@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,40 +17,147 @@ import (
 	"github.com/AungKyawPhyo1142/sentria-go/internal/core/service"
 	"github.com/AungKyawPhyo1142/sentria-go/internal/models"
 	"github.com/AungKyawPhyo1142/sentria-go/internal/platform/external_apis"
+	"github.com/AungKyawPhyo1142/sentria-go/internal/worker"
 )
 
 func main() {
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("FATAL: Failed to load configuration: %v", err)
 	}
-	log.Printf("Starting server on port %d", cfg.ServerPort)
+	log.Printf("Starting Sentria Fact-Checking Service on port %d in %s mode...", cfg.ServerPort, cfg.GinMode)
 
-	router := api.SetupRouter(cfg)
+	// --- Initialize Dependencies for FactCheckService ---
+	gdacsAPIClient := external_apis.NewGDACSClient()            // Create GDACS client instance
+	factCheckSvc := service.NewFactCheckService(gdacsAPIClient) // Create FactCheckService instance
+	// ----------------------------------------------------
 
-	// run test as go-routine
-	go testGDACSFactCheckFromFile()
+	var jobConsumer *worker.JobConsumer
+	var consumerWg sync.WaitGroup // WaitGroup to wait for consumer goroutine to finish
 
-	// TODO: init jobQueue consumer
+	if cfg.RabbitMQ_URL != "" && cfg.Factcheck_Queue_Name != "" {
+		jobConsumer, err = worker.NewJobConsumer(cfg, factCheckSvc) // <-- PASS factCheckSvc here
+		if err != nil {
+			log.Printf("WARNING: Failed to initialize RabbitMQ Job Consumer: %v. Will not consume jobs.", err)
+			// Decide if this is fatal. If MQ is essential, log.Fatalf here.
+			// For now, allow server to start but log a clear warning.
+			jobConsumer = nil // Ensure it's nil so we don't try to use it
+		} else {
+			consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 
-	serverAddr := fmt.Sprintf(":%d", cfg.ServerPort)
-	go func() {
-		if err := router.Run(serverAddr); err != nil {
-			log.Fatalf("Failed to start server: %v", err)
+			consumerWg.Add(1)
+			go func() {
+				defer consumerWg.Done()
+				defer log.Println("[Main] Consumer goroutine has exited.")
+				jobConsumer.StartConsuming(consumerCtx) // This will block until ctx is cancelled or fatal error
+			}()
+			log.Println("[Main] RabbitMQ Job Consumer listening for jobs.")
+
+			// Graceful shutdown setup for when consumer IS active
+			quit := make(chan os.Signal, 1)
+			signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+			go func() {
+				sig := <-quit
+				log.Printf("Received signal: %s. Initiating graceful shutdown...", sig)
+
+				log.Println("[Main] Signaling job consumer to stop via Stop()...")
+				if jobConsumer != nil {
+					jobConsumer.Stop()
+				}
+
+				log.Println("[Main] Cancelling consumer context...")
+				cancelConsumer() // Cancel the context for the consumer loop
+
+				log.Println("[Main] Waiting for consumer goroutine to complete (max 5s)...")
+				// Wait for the consumer goroutine to finish, with a timeout
+				waitTimeout := time.After(5 * time.Second)
+				select {
+				case <-waitTimeout:
+					log.Println("[Main] Timeout waiting for consumer to stop. Proceeding with shutdown.")
+				case <-(func() chan struct{} { // Anonymous func to wait on WaitGroup in select
+					doneWg := make(chan struct{})
+					go func() {
+						consumerWg.Wait()
+						close(doneWg)
+					}()
+					return doneWg
+				}()):
+					log.Println("[Main] Consumer goroutine completed.")
+				}
+
+				if jobConsumer != nil {
+					log.Println("[Main] Closing job consumer RabbitMQ resources...")
+					jobConsumer.Close()
+				}
+
+				// Here you would also gracefully shut down the Gin HTTP server if it's running
+				// e.g., srv.Shutdown(context.Background())
+				log.Println("Application shut down attempt complete. Exiting.")
+				os.Exit(0)
+			}()
 		}
-	}()
-	log.Printf("Gin server started on port %v", serverAddr)
+	} else {
+		log.Println("[Main] RabbitMQ URI or Queue Name not configured. Job consumer will NOT start.")
+		// Simpler shutdown if no consumer
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-quit
+		log.Printf("Received signal: %s. Shutting down (no consumer active)...", sig)
+		os.Exit(0)
+	}
 
-	// graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit // block until signal is received
-	log.Println("Shutting down server...")
+	// Setup and run Gin server (this will block the main goroutine here if not handled above)
+	// If the consumer logic above results in os.Exit(0), this part might not be reached
+	// in the graceful shutdown path when a consumer is active.
+	// Consider running Gin server in its own goroutine and managing its shutdown too.
+	router := api.SetupRouter(cfg)
+	serverAddr := fmt.Sprintf(":%d", cfg.ServerPort)
+	log.Printf("Attempting to start Gin HTTP server on address: %s", serverAddr)
+	// For graceful HTTP server shutdown, you'd use http.Server and its Shutdown method.
+	// Example:
+	// srv := &http.Server{ Addr: serverAddr, Handler: router }
+	// go func() { if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatalf(...) } }()
+	// Then in shutdown: ctxShutdown, _ := context.WithTimeout(...); srv.Shutdown(ctxShutdown)
 
-	// TODO: close jobQueue consumer
-	log.Println("Server stopped")
-
+	if err := router.Run(serverAddr); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("FATAL: Failed to run Gin server: %v", err)
+	}
+	log.Println("Gin HTTP server finished.") // Should only be reached if Gin server is explicitly stopped.
 }
+
+// func main() {
+// 	cfg, err := config.LoadConfig()
+// 	if err != nil {
+// 		log.Fatalf("Failed to load config: %v", err)
+// 	}
+// 	log.Printf("Starting server on port %d", cfg.ServerPort)
+
+// 	router := api.SetupRouter(cfg)
+
+// 	// run test as go-routine
+// 	go testGDACSFactCheckFromFile()
+
+// 	// TODO: init jobQueue consumer
+
+// 	serverAddr := fmt.Sprintf(":%d", cfg.ServerPort)
+// 	go func() {
+// 		if err := router.Run(serverAddr); err != nil {
+// 			log.Fatalf("Failed to start server: %v", err)
+// 		}
+// 	}()
+// 	log.Printf("Gin server started on port %v", serverAddr)
+
+// 	// graceful shutdown
+// 	quit := make(chan os.Signal, 1)
+// 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+// 	<-quit // block until signal is received
+// 	log.Println("Shutting down server...")
+
+// 	// TODO: close jobQueue consumer
+// 	log.Println("Server stopped")
+
+// }
 
 // Updated test function to load an array of data from test_disaster_report.json
 func testGDACSFactCheckFromFile() {

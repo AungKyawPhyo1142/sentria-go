@@ -7,8 +7,10 @@ import (
 )
 
 type Config struct {
-	ServerPort int
-	GinMode    string
+	ServerPort           int
+	GinMode              string
+	RabbitMQ_URL         string
+	Factcheck_Queue_Name string
 
 	// add other configs here
 	// JobQueuesAddress string
@@ -30,9 +32,24 @@ func LoadConfig() (*Config, error) {
 	if ginMode == "" {
 		ginMode = "debug"
 	}
+
+	rabbitURL := os.Getenv("RABBITMQ_URL")
+	if rabbitURL == "" {
+		rabbitURL = "amqp://guest:guest@localhost:5672/"
+		log.Printf("Warning: RABBITMQ_URL not set, using default: %s", rabbitURL)
+	}
+
+	queueName := os.Getenv("FACTCHECK_QUEUE_NAME")
+	if queueName == "" {
+		queueName = "sentria_factcheck_jobs"
+		log.Printf("Warning: FACTCHECK_QUEUE_NAME not set, using default: %s", queueName)
+	}
+
 	return &Config{
-		ServerPort: port,
-		GinMode:    ginMode,
+		ServerPort:           port,
+		GinMode:              ginMode,
+		RabbitMQ_URL:         rabbitURL,
+		Factcheck_Queue_Name: queueName,
 	}, nil
 
 }

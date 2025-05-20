@@ -30,9 +30,6 @@ type DisasterReportData struct {
 		Caption string `json:"caption,omitempty"`
 	} `json:"media,omitempty"`
 
-	// Tags were removed as per your request, but if added back, would be:
-	// Tags []string `json:"tags,omitempty"`
-
 	ReporterUserID int `json:"reporterUserId"` // User ID (from PG) of the person who created the report
 }
 
