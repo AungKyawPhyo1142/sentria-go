@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/AungKyawPhyo1142/sentria-go/internal/config"
@@ -14,34 +15,48 @@ import (
 )
 
 const (
-	consumerTag       = "sentria-factchecker-consumer"
-	connectRetryDelay = 5 * time.Second
-	maxConnectRetries = 10
-	factCheckTimeout  = 60 * time.Second
+	consumerTag        = "sentria-factchecker-consumer"
+	connectRetryDelay  = 5 * time.Second
+	maxConnectRetries  = 10
+	factCheckTimeout   = 60 * time.Second
+	defaultConcurrency = 10 // number of concurrent workers
 )
 
 // JobConsumer is a struct that consumes jobs from a queue
 type JobConsumer struct {
-	conn             *amqp.Connection
-	channel          *amqp.Channel
-	cfg              *config.Config
-	factCheckService *service.FactCheckService
-	done             chan bool // channel to signal when the consumer is done
-	isStopping       bool
-	notifyConnClose  chan *amqp.Error
-	notifyChanClose  chan *amqp.Error
+	conn                *amqp.Connection
+	channel             *amqp.Channel
+	cfg                 *config.Config
+	factCheckService    *service.FactCheckService
+	done                chan bool // channel to signal when the consumer is done
+	isStopping          bool
+	notifyConnClose     chan *amqp.Error
+	notifyChanClose     chan *amqp.Error
+	processingSemaphore chan struct{}  // semaphore to limit concurrent processing
+	wg                  sync.WaitGroup // to wait for all workers to finish
+	concurrency         int            // max concurrent go-routines/workers
 }
 
-func NewJobConsumer(cfg *config.Config, fcService *service.FactCheckService) (*JobConsumer, error) {
+func NewJobConsumer(cfg *config.Config, fcService *service.FactCheckService, concurrency int) (*JobConsumer, error) {
+
+	if cfg == nil {
+		return nil, fmt.Errorf("cfg cannot be nil")
+	}
 
 	if fcService == nil {
 		return nil, fmt.Errorf("factCheckService cannot be nil")
 	}
 
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+
 	jc := &JobConsumer{
-		cfg:              cfg,
-		factCheckService: fcService, // pass the factcheck service here,
-		done:             make(chan bool),
+		cfg:                 cfg,
+		factCheckService:    fcService, // pass the factcheck service here,
+		done:                make(chan bool),
+		concurrency:         concurrency,
+		processingSemaphore: make(chan struct{}, concurrency), // initialize with concurrency workers
 	}
 
 	if err := jc.connect(); err != nil {
@@ -154,9 +169,9 @@ func (jc *JobConsumer) connect() error {
 	// Optional: Set Quality of Service (QoS) to process one message at a time initially
 	// This means the consumer will only receive the next message after it acknowledges the current one.
 	err = jc.channel.Qos(
-		1,     // prefetch count: How many messages the server will deliver, at most, at a time.
-		0,     // prefetch size: Server will try to keep at least this many bytes undelivered. (0 means no specific limit)
-		false, // global: false means QoS applies per new consumer (this channel)
+		jc.concurrency, // prefetch count: How many messages the server will deliver, at most, at a time.
+		0,              // prefetch size: Server will try to keep at least this many bytes undelivered. (0 means no specific limit)
+		false,          // global: false means QoS applies per new consumer (this channel)
 	)
 	if err != nil {
 		log.Printf("[JobConsumer] Failed to set QoS: %v", err)
@@ -164,6 +179,60 @@ func (jc *JobConsumer) connect() error {
 		log.Printf("[JobConsumer] Set QoS set to prefetch count: 1")
 	}
 	return nil // success
+}
+
+// processMessage handles a single message in its own go routine
+func (jc *JobConsumer) processMessage(ctx context.Context, d amqp.Delivery) {
+	defer func() {
+		<-jc.processingSemaphore // release the semaphore when the worker is done
+		jc.wg.Done()             // decrement the wait group counter
+		if r := recover(); r != nil {
+			log.Printf("[JobConsumer] CRITICAL: Panic recovered in processMessage for delivery %d: %v. Nacking message.", d.DeliveryTag, r)
+			// Nack the message if a panic occurs during processing.
+			if nackErr := d.Nack(false, false); nackErr != nil {
+				log.Printf("[JobConsumer] Error Nacking message %d after panic: %v", d.DeliveryTag, nackErr)
+			}
+		}
+	}()
+	log.Printf("[JobConsumer] Received a message with delivery tag: %d, message id: %s", d.DeliveryTag, d.MessageId)
+
+	// unmarshal into models.DisasterReportData and pass to factCheckService
+	var reportData models.DisasterReportData
+	if errUnmarshal := json.Unmarshal(d.Body, &reportData); errUnmarshal != nil {
+		log.Printf("[JobConsumer] Failed to unmarshal message into DisasterReportData: %v, Body: %s", errUnmarshal, string(d.Body))
+		if nackErr := d.Nack(false, false); nackErr != nil {
+			log.Printf("[JobConsumer] Error Nacking unparseable message %d: %v", d.DeliveryTag, nackErr)
+		}
+		return
+	}
+
+	log.Printf("[JobConsumer] Successfully unmarshaled. PG_ID: %s, Title: '%s', Type: %s, Timestamp: %s",
+		reportData.PostgresReportID, reportData.Title, reportData.IncidentType, reportData.IncidentTimestamp.Format(time.RFC3339))
+
+	// * Actual Factchecking
+	log.Printf("[JobConsumer] Processing report %s with FactcheckingService...", reportData.PostgresReportID)
+	// create a new context with timeout for each report
+	serviceCtx, serviceCancle := context.WithTimeout(context.Background(), factCheckTimeout)
+	factCheckResult, processErr := jc.factCheckService.VerifyReportWithGDACS(serviceCtx, reportData)
+	serviceCancle()
+
+	if processErr != nil {
+		log.Printf("[JobConsumer] FactcheckingService failed for report %s: %v", reportData.PostgresReportID, processErr)
+		if nackErr := d.Nack(false, false); nackErr != nil {
+			log.Printf("[JobConsumer] Error Nacking message %d: %v", d.DeliveryTag, nackErr)
+		}
+		return
+	}
+
+	log.Printf("[JobConsumer] FactcheckingService completed for report %s. Result: %v", reportData.PostgresReportID, factCheckResult)
+
+	// TODO: Send `factcheckResult` back to NodeJs API
+
+	if errAck := d.Ack(false); errAck != nil {
+		log.Printf("[JobConsumer] Error Acknowledging message %d: %v", d.DeliveryTag, errAck)
+	} else {
+		log.Printf("[JobConsumer] Successfully Acknowledged message %d", d.DeliveryTag)
+	}
 }
 
 // connect method
@@ -199,8 +268,8 @@ func (jc *JobConsumer) connect() error {
 // this method will block until error occurs or Stop is called
 func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 
-	if jc.channel == nil {
-		log.Println("[JobConsumer] Channel is nil. Attempting to reconnect before consuming.")
+	if jc.channel == nil || jc.conn == nil || jc.conn.IsClosed() {
+		log.Println("[JobConsumer] Channel or connection is nil or closed. Attempting to reconnect before consuming.")
 		if err := jc.handleReconnect(ctx); err != nil {
 			log.Printf("[JobConsumer] FATAL: Failed to reconnect during StartConsuming: %v. Consumer stopping.", err)
 			// No need to signal jc.done here, as this goroutine will exit.
@@ -253,7 +322,7 @@ func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 	for {
 		select {
 
-		case <-ctx.Done():
+		case <-ctx.Done(): // application is shutting down
 			log.Printf("[JobConsumer] Context cancelled. Stopping consumer.")
 			jc.Stop()
 			return
@@ -268,92 +337,36 @@ func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 				}
 				return
 			}
-			log.Printf("[JobConsumer] Received a message. DeliveryTag: %d, MessageID: %s", d.DeliveryTag, d.MessageId)
-
-			// unmarshal into models.DisasterReportData and pass to factCheckService
-			var reportData models.DisasterReportData
-			if errUnmarshal := json.Unmarshal(d.Body, &reportData); errUnmarshal != nil {
-				log.Printf("[JobConsumer] Failed to unmarshal message into DisasterReportData: %v, Body: %s", errUnmarshal, string(d.Body))
-				if nackErr := d.Nack(false, false); nackErr != nil {
-					log.Printf("[JobConsumer] Error Nacking unparseable message %d: %v", d.DeliveryTag, nackErr)
-				}
-				continue
-			}
-
-			log.Printf("[JobConsumer] Successfully unmarshaled. PG_ID: %s, Title: '%s', Type: %s, Timestamp: %s",
-				reportData.PostgresReportID, reportData.Title, reportData.IncidentType, reportData.IncidentTimestamp.Format(time.RFC3339))
-
-			// * Actual Factchecking
-			log.Printf("[JobConsumer] Processing report %s with FactcheckingService...", reportData.PostgresReportID)
-			// create a new context with timeout for each report
-			serviceCtx, serviceCancle := context.WithTimeout(context.Background(), factCheckTimeout)
-			factCheckResult, processErr := jc.factCheckService.VerifyReportWithGDACS(serviceCtx, reportData)
-			serviceCancle()
-
-			if processErr != nil {
-				log.Printf("[JobConsumer] FactcheckingService failed for report %s: %v", reportData.PostgresReportID, processErr)
-				if nackErr := d.Nack(false, false); nackErr != nil {
-					log.Printf("[JobConsumer] Error Nacking message %d: %v", d.DeliveryTag, nackErr)
-				}
-				continue
-			}
-
-			log.Printf("[JobConsumer] FactcheckingService completed for report %s. Result: %v", reportData.PostgresReportID, factCheckResult)
-			if errAck := d.Ack(false); errAck != nil {
-				log.Printf("[JobConsumer] Error Acknowledging message %d: %v", d.DeliveryTag, errAck)
-			} else {
-				log.Printf("[JobConsumer] Successfully Acknowledged message %d", d.DeliveryTag)
-			}
-
-			// var genericPayload map[string]interface{}
-			// err := json.Unmarshal(d.Body, &genericPayload)
-			// if err != nil {
-			// 	log.Printf("[JobConsumer] Failed to unmarshal message: %v", err)
-			// 	d.Nack(false, false) // Nack, no requeue
-			// 	continue             // move to next message
-			// }
-
-			// log.Printf("[JobConsumer] Unmarshalled message: %v", genericPayload)
-
-			// // example: check for specific fields from the Node.js test mesage
-			// if msg, ok := genericPayload["message"].(string); ok {
-			// 	log.Printf("[JobConsumer] Extracted Message: %s", msg)
-			// }
-
-			// // Acknowledge the message once processed
-			// log.Printf("[JobConsumer] Processing completed. Acknowleging message (DeliveryTag: %d)", d.DeliveryTag)
-
-			// // Acknowledge the message
-			// if err := d.Ack(false); err != nil { // false for single message ack
-			// 	log.Printf("[JobConsumer] Failed to acknowledge message: %v", err)
-			// } else {
-			// 	log.Printf("[JobConsumer] Message acknowledged (DeliveryTag: %d)", d.DeliveryTag)
-			// }
+			jc.wg.Add(1)                         // increment the wait group counter
+			jc.processingSemaphore <- struct{}{} // acquire the semaphore slot (blocks if full)
+			go jc.processMessage(ctx, d)         // process the message in a new goroutine
 
 		case err := <-jc.notifyConnClose:
 			log.Printf("[JobConsumer] Connection closed event received: %v", err)
+			jc.clearNotifications()
 			if !jc.isStopping {
 				if reconnErr := jc.handleReconnect(ctx); reconnErr != nil {
 					log.Printf("[JobConsumer] FATAL: Failed to reconnect after connection closed: %v. Consumer stopping.", reconnErr)
+					return
 				}
 			}
 			return
 
-		case err := <-jc.notifyChanClose:
-			log.Printf("[JobConsumer] Channel closed event received via notify: %v.", err)
-			if !jc.isStopping {
-				if jc.conn == nil || jc.conn.IsClosed() {
-					log.Println("[JobConsumer] Connection also appears closed. Reconnect will handle.")
-					// The notifyConnClose handler should ideally manage full reconnection.
-					// If it doesn't, the next message delivery attempt will fail, triggering the !ok case.
-				} else {
-					log.Println("[JobConsumer] Channel closed, but connection seems alive. Attempting to re-establish channel and consumer.")
-					if reconnErr := jc.handleReconnect(ctx); reconnErr != nil {
-						log.Printf("[JobConsumer] FATAL: Reconnect failed after channel close: %v. Consumer stopping.", reconnErr)
-					}
-				}
-			}
-			return
+		// case err := <-jc.notifyChanClose:
+		// 	log.Printf("[JobConsumer] Channel closed event received via notify: %v.", err)
+		// 	if !jc.isStopping {
+		// 		if jc.conn == nil || jc.conn.IsClosed() {
+		// 			log.Println("[JobConsumer] Connection also appears closed. Reconnect will handle.")
+		// 			// The notifyConnClose handler should ideally manage full reconnection.
+		// 			// If it doesn't, the next message delivery attempt will fail, triggering the !ok case.
+		// 		} else {
+		// 			log.Println("[JobConsumer] Channel closed, but connection seems alive. Attempting to re-establish channel and consumer.")
+		// 			if reconnErr := jc.handleReconnect(ctx); reconnErr != nil {
+		// 				log.Printf("[JobConsumer] FATAL: Reconnect failed after channel close: %v. Consumer stopping.", reconnErr)
+		// 			}
+		// 		}
+		// 	}
+		// 	return
 
 		case <-jc.done: // if stop() was called or connetion/channel error
 			log.Printf("[JobConsumer] Stop signal received. Exiting consumer.")
@@ -362,9 +375,20 @@ func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 	}
 }
 
+func (jc *JobConsumer) clearNotifications() {
+	if jc.notifyConnClose != nil {
+		close(jc.notifyConnClose) // close to stop go-routines potentially reading from old ones
+		jc.notifyConnClose = nil
+	}
+	if jc.notifyChanClose != nil {
+		close(jc.notifyChanClose) // close to stop go-routines potentially reading from old ones
+		jc.notifyChanClose = nil
+	}
+}
+
 func (jc *JobConsumer) handleReconnect(ctx context.Context) error {
 	log.Printf("[JobConsumer] Attempting to reconnect...")
-
+	jc.clearNotifications()
 	if jc.channel != nil {
 		jc.channel.Close()
 		jc.channel = nil
@@ -374,15 +398,28 @@ func (jc *JobConsumer) handleReconnect(ctx context.Context) error {
 		jc.conn = nil
 	}
 
-	// attempt to reconnect
-	if err := jc.connect(); err != nil {
-		log.Printf("[JobConsumer] Reconnect failed: %v", err)
-		return fmt.Errorf("failed to reconnect: %w", err)
+	for i := 0; i < maxConnectRetries; i++ {
+		if jc.isStopping || ctx.Err() != nil {
+			return fmt.Errorf("reconnect aborted: %w", ctx.Err())
+		}
+		log.Printf("[JobConsumer] Reconnect attempt %d...", i+1)
+		// attempt to reconnect
+		if err := jc.connect(); err == nil {
+			log.Printf("[JobConsumer] Reconnect successful.")
+			go jc.StartConsuming(ctx) //! IMPORTANT: pass the original context to StartConsuming
+			return nil
+		}
+		log.Printf("[JobConsumer] Reconnect failed. Retrying in %v...", connectRetryDelay)
+		select {
+		case <-time.After(connectRetryDelay):
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-jc.done:
+			return fmt.Errorf("reconnect aborted: %w", ctx.Err())
+		}
 	}
 
-	log.Println("[JobConsumer] Reconnected successfully.")
-	go jc.StartConsuming(ctx) //! IMPORTANT: pass the original context to StartConsuming
-	return nil
+	return fmt.Errorf("failed to reconnect after %d attempts", maxConnectRetries) //! IMPORTAN
 
 }
 
@@ -401,7 +438,11 @@ func (jc *JobConsumer) Stop() {
 
 // Close cleanup the rabbitMQ resources.
 func (jc *JobConsumer) Close() {
-	log.Println("[JobConsumer] Close method called. Closing RabbitMQ channel and connection resources...")
+	log.Println("[JobConsumer] Close method called. Waiting for all processing goroutines to finish...")
+	jc.wg.Wait() // Wait for all processing goroutines to finish
+	log.Printf("[JobConsumer] All processing goroutines finished.")
+
+	log.Println("[JobConsumer] Closing RabbitMQ channel and connection resources. ")
 	if jc.channel != nil {
 		log.Println("[JobConsumer] Attempting to close channel...")
 		err := jc.channel.Close()

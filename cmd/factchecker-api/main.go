@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -33,10 +32,10 @@ func main() {
 	// ----------------------------------------------------
 
 	var jobConsumer *worker.JobConsumer
-	var consumerWg sync.WaitGroup // WaitGroup to wait for consumer goroutine to finish
 
 	if cfg.RabbitMQ_URL != "" && cfg.Factcheck_Queue_Name != "" {
-		jobConsumer, err = worker.NewJobConsumer(cfg, factCheckSvc) // <-- PASS factCheckSvc here
+		numberOfWorkers := 10
+		jobConsumer, err = worker.NewJobConsumer(cfg, factCheckSvc, numberOfWorkers) // <-- PASS factCheckSvc here
 		if err != nil {
 			log.Printf("WARNING: Failed to initialize RabbitMQ Job Consumer: %v. Will not consume jobs.", err)
 			// Decide if this is fatal. If MQ is essential, log.Fatalf here.
@@ -45,13 +44,15 @@ func main() {
 		} else {
 			consumerCtx, cancelConsumer := context.WithCancel(context.Background())
 
-			consumerWg.Add(1)
-			go func() {
-				defer consumerWg.Done()
-				defer log.Println("[Main] Consumer goroutine has exited.")
-				jobConsumer.StartConsuming(consumerCtx) // This will block until ctx is cancelled or fatal error
-			}()
+			go jobConsumer.StartConsuming(consumerCtx)
 			log.Println("[Main] RabbitMQ Job Consumer listening for jobs.")
+
+			// consumerWg.Add(1)
+			// go func() {
+			// 	defer consumerWg.Done()
+			// 	defer log.Println("[Main] Consumer goroutine has exited.")
+			// 	jobConsumer.StartConsuming(consumerCtx) // This will block until ctx is cancelled or fatal error
+			// }()
 
 			// Graceful shutdown setup for when consumer IS active
 			quit := make(chan os.Signal, 1)
@@ -69,30 +70,11 @@ func main() {
 				log.Println("[Main] Cancelling consumer context...")
 				cancelConsumer() // Cancel the context for the consumer loop
 
-				log.Println("[Main] Waiting for consumer goroutine to complete (max 5s)...")
-				// Wait for the consumer goroutine to finish, with a timeout
-				waitTimeout := time.After(5 * time.Second)
-				select {
-				case <-waitTimeout:
-					log.Println("[Main] Timeout waiting for consumer to stop. Proceeding with shutdown.")
-				case <-(func() chan struct{} { // Anonymous func to wait on WaitGroup in select
-					doneWg := make(chan struct{})
-					go func() {
-						consumerWg.Wait()
-						close(doneWg)
-					}()
-					return doneWg
-				}()):
-					log.Println("[Main] Consumer goroutine completed.")
-				}
-
 				if jobConsumer != nil {
-					log.Println("[Main] Closing job consumer RabbitMQ resources...")
+					log.Println("[Main] calling jobConsumer Close()...")
 					jobConsumer.Close()
 				}
 
-				// Here you would also gracefully shut down the Gin HTTP server if it's running
-				// e.g., srv.Shutdown(context.Background())
 				log.Println("Application shut down attempt complete. Exiting.")
 				os.Exit(0)
 			}()
