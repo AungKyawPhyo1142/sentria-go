@@ -6,11 +6,11 @@ import "time"
 // DisasterReportData contains the essential information from a Sentria disaster report
 // that will be passed to the fact-checking service (e.g., via a job queue).
 type DisasterReportData struct {
+	ReportName string `json:"reportName"` // Name of the report, e.g., "Flood in City X"
 	// IDs to identify the report throughout the system
 	PostgresReportID string `json:"postgresReportId"` // The CUID from your Node.js app's PostgreSQL 'Report' table
-	MongoDocID       string `json:"mongoDocId"`       // The ObjectId string from your Node.js app's MongoDB 'disaster_incidents' collection
+	MongoDocID       string `json:"mongoDbDocId"`     // The ObjectId string from your Node.js app's MongoDB 'disaster_incidents' collection
 
-	Title             string    `json:"title"`             // Specific title of the disaster event
 	Description       string    `json:"description"`       // User-provided description
 	IncidentType      string    `json:"incidentType"`      // e.g., "FLOOD", "EARTHQUAKE", "FIRE", "STORM", "LANDSLIDE", "OTHER"
 	Severity          string    `json:"severity"`          // e.g., "UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"
@@ -21,7 +21,6 @@ type DisasterReportData struct {
 	Longitude float64 `json:"longitude"`
 	City      string  `json:"city"`
 	Country   string  `json:"country"`
-	Address   string  `json:"address,omitempty"` // Optional: more specific address string
 
 	// Media URLs (assuming URLs are strings)
 	Media []struct {
