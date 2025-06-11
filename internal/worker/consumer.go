@@ -15,11 +15,13 @@ import (
 )
 
 const (
-	consumerTag        = "sentria-factchecker-consumer"
-	connectRetryDelay  = 5 * time.Second
-	maxConnectRetries  = 10
-	factCheckTimeout   = 60 * time.Second
-	defaultConcurrency = 10 // number of concurrent workers
+	consumerTag             = "sentria-factchecker-consumer"
+	connectRetryDelay       = 5 * time.Second
+	maxConnectRetries       = 10
+	factCheckTimeout        = 60 * time.Second
+	factCheckPublishTimeout = 30 * time.Second
+	fa                      = factCheckPublishTimeout
+	defaultConcurrency      = 10 // number of concurrent workers
 )
 
 // JobConsumer is a struct that consumes jobs from a queue
@@ -69,58 +71,58 @@ func NewJobConsumer(cfg *config.Config, fcService *service.FactCheckService, con
 	}
 
 	return jc, nil
+}
 
-	// var err error
-	// log.Printf("[JobConsumer] Attempting to connect to RabbitMQ at %s", jc.cfg.RabbitMQ_URL)
+func (jc *JobConsumer) PublishFactCheckResult(ctx context.Context, result *models.FactCheckResult) error {
+	if jc.channel == nil || jc.conn == nil || jc.conn.IsClosed() {
+		log.Println("[JobConsumer-Result] Channel or connection is nil or closed. Attempting to reconnect before publishing.")
+		if err := jc.handleReconnect(ctx); err != nil {
+			log.Printf("[JobConsumer-Result] Failed to reconnect during PublishFactCheckResult: %v", err)
+			return fmt.Errorf("failed to reconnect during PublishFactCheckResult: %w", err)
+		}
+	}
 
-	// jc.conn, err = amqp.Dial(cfg.RabbitMQ_URL)
-	// if err != nil {
-	// 	log.Printf("[JobConsumer] Failed to connect to RabbitMQ: %v", err)
-	// 	return nil, err
-	// }
-	// log.Printf("[JobConsumer] Connected to RabbitMQ at %s", jc.cfg.RabbitMQ_URL)
+	_, err := jc.channel.QueueDeclare(
+		jc.cfg.Factcheck_Result_Queue_Name, // queue name
+		true,                               // durable
+		false,                              // delete when unused
+		false,                              // exclusive
+		false,                              // no-wait
+		nil,                                // arguments
+	)
 
-	// jc.channel, err = jc.conn.Channel()
-	// if err != nil {
-	// 	log.Printf("[JobConsumer] Failed to open a channel: %v", err)
-	// 	return nil, err
-	// }
-	// log.Printf("[JobConsumer] Opened a channel")
+	if err != nil {
+		log.Printf("[JobConsumer-Result] Failed to declare a queue: %v", err)
+		return fmt.Errorf("[JobConsumer-Result] failed to declare a queue: %v", err)
+	}
 
-	// // Ensure that the queue exists and durable (should match producer's assetion)
+	body, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("[JobConsumer-Result] Failed to marshal result: %v", err)
+		return fmt.Errorf("[JobConsumer-Result] failed to marshal result: %v", err)
+	}
 
-	// _, err = jc.channel.QueueDeclare(
-	// 	cfg.Factcheck_Queue_Name, // queue name
-	// 	true,                     // durable
-	// 	false,                    // delete when unused
-	// 	false,                    // exclusive
-	// 	false,                    // no-wait
-	// 	nil,                      // arguments
-	// )
-	// if err != nil {
-	// 	log.Printf("[JobConsumer] Failed to declare a queue: %v", err)
-	// 	jc.channel.Close()
-	// 	jc.conn.Close()
-	// 	return nil, err
-	// }
+	err = jc.channel.PublishWithContext(
+		ctx,
+		"",
+		jc.cfg.Factcheck_Result_Queue_Name, // routing key
+		false,                              // mandatory
+		false,                              // immediate
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			DeliveryMode: amqp.Persistent, // make message persistent
+			Timestamp:    time.Now(),
+			MessageId:    result.PostgresReportID,
+		},
+	)
 
-	// log.Printf("[JobConsumer] Declared a queue: %s", cfg.Factcheck_Queue_Name)
-
-	// // Optional: Set Quality of Service (QoS) to process one message at a time initially
-	// // This means the consumer will only receive the next message after it acknowledges the current one.
-	// err = jc.channel.Qos(
-	// 	1,     // prefetch count: How many messages the server will deliver, at most, at a time.
-	// 	0,     // prefetch size: Server will try to keep at least this many bytes undelivered. (0 means no specific limit)
-	// 	false, // global: false means QoS applies per new consumer (this channel)
-	// )
-	// if err != nil {
-	// 	log.Printf("[JobConsumer] Failed to set QoS: %v", err)
-	// } else {
-	// 	log.Printf("[JobConsumer] Set QoS set to prefetch count: 1")
-	// }
-
-	// return jc, nil
-
+	if err != nil {
+		log.Printf("[JobConsumer-Result] Failed to publish a message: %v", err)
+		return fmt.Errorf("[JobConsumer-Result] failed to publish a message: %v", err)
+	}
+	log.Printf("[JobConsumer-Result] Published a message with ID: %s", result.PostgresReportID)
+	return nil
 }
 
 func (jc *JobConsumer) connect() error {
@@ -158,7 +160,6 @@ func (jc *JobConsumer) connect() error {
 		nil,                         // arguments
 	)
 	if err != nil {
-
 		jc.channel.Close()
 		jc.conn.Close()
 		return fmt.Errorf("[JobConsumer] Failed to declare a queue: %v", err)
@@ -206,8 +207,8 @@ func (jc *JobConsumer) processMessage(ctx context.Context, d amqp.Delivery) {
 		return
 	}
 
-	log.Printf("[JobConsumer] Successfully unmarshaled. PG_ID: %s, Title: '%s', Type: %s, Timestamp: %s",
-		reportData.PostgresReportID, reportData.Title, reportData.IncidentType, reportData.IncidentTimestamp.Format(time.RFC3339))
+	log.Printf("[JobConsumer] Successfully unmarshaled. PG_ID: %s, MongoDocID: %s, ReportName: %s, Type: %s, Timestamp: %s",
+		reportData.PostgresReportID, reportData.MongoDocID, reportData.ReportName, reportData.IncidentType, reportData.IncidentTimestamp.Format(time.RFC3339))
 
 	// * Actual Factchecking
 	log.Printf("[JobConsumer] Processing report %s with FactcheckingService...", reportData.PostgresReportID)
@@ -226,7 +227,20 @@ func (jc *JobConsumer) processMessage(ctx context.Context, d amqp.Delivery) {
 
 	log.Printf("[JobConsumer] FactcheckingService completed for report %s. Result: %v", reportData.PostgresReportID, factCheckResult)
 
-	// TODO: Send `factcheckResult` back to NodeJs API
+	// * Publish FactCheckResult
+	log.Printf("[JobConsumer] Publishing fact check result for report %s...", reportData.PostgresReportID)
+	publishCtx, publishCancel := context.WithTimeout(context.Background(), factCheckPublishTimeout)
+	defer publishCancel()
+	if err := jc.PublishFactCheckResult(publishCtx, factCheckResult); err != nil {
+		log.Printf("[JobConsumer] Failed to publish fact check result for report %s: %v", reportData.PostgresReportID, err)
+		// Nack the message if publishing fails
+		if nackErr := d.Nack(false, true); nackErr != nil {
+			log.Printf("[JobConsumer] Error Nacking message %d: %v", d.DeliveryTag, nackErr)
+		} else {
+			log.Printf("[JobConsumer] Successfully Nacked message %d", d.DeliveryTag)
+		}
+		return
+	}
 
 	if errAck := d.Ack(false); errAck != nil {
 		log.Printf("[JobConsumer] Error Acknowledging message %d: %v", d.DeliveryTag, errAck)
@@ -234,35 +248,6 @@ func (jc *JobConsumer) processMessage(ctx context.Context, d amqp.Delivery) {
 		log.Printf("[JobConsumer] Successfully Acknowledged message %d", d.DeliveryTag)
 	}
 }
-
-// connect method
-// func (jc *JobConsumer) connect() error {
-// 	var err error
-// 	for i := 0; i < maxConnectRetries; i++ {
-// 		log.Printf("[JobConsumer] Attempting to reconnect to RabbitMQ at attempt %d", i+1)
-// 		jc.conn, err = amqp.Dial(jc.cfg.RabbitMQ_URL)
-// 		if err == nil {
-// 			log.Printf("[JobConsumer] Successfully reconnected to RabbitMQ")
-// 			jc.channel, err = jc.conn.Channel()
-// 			if err == nil {
-// 				log.Printf("[JobConsumer] Successfully re-opened channel")
-// 				jc.notifyConnClose = make(chan *amqp.Error) // reinitialize channel close notification connection
-// 				jc.notifyChanClose = make(chan *amqp.Error) // reinitialize channel close notification channel
-// 				jc.conn.NotifyClose(jc.notifyConnClose)
-// 				jc.channel.NotifyClose(jc.notifyChanClose)
-// 				return nil
-// 			}
-// 			log.Printf("[JobConsumer] Failed to re-open channel: %v", err)
-// 			jc.conn.Close()
-// 		}
-// 		log.Printf("[JobConsumer] Failed to reconnect to RabbitMQ: %v", err)
-// 		if i < maxConnectRetries-1 {
-// 			log.Printf("[JobConsumer] Retrying in %v...", connectRetryDelay)
-// 			time.Sleep(connectRetryDelay)
-// 		}
-// 	}
-// 	return fmt.Errorf("failed to reconnect after %d attempts: %w", maxConnectRetries, err)
-// }
 
 // Consume starts consuming jobs from the queue
 // this method will block until error occurs or Stop is called
@@ -279,23 +264,6 @@ func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 	}
 
 	log.Printf("[JobConsumer] Starting to consume messages from queue: %s", jc.cfg.Factcheck_Queue_Name)
-
-	// // handle connection errors in a separate goroutine to attempt to reconnect
-	// go func() {
-	// 	connErr := <-jc.conn.NotifyClose(make(chan *amqp.Error))
-	// 	if connErr != nil {
-	// 		log.Printf("[JobConsumer] Connection closed unexpectedly: %v", connErr)
-	// 		jc.done <- connErr
-	// 	}
-	// }()
-
-	// go func() {
-	// 	chanErr := <-jc.channel.NotifyClose(make(chan *amqp.Error))
-	// 	if chanErr != nil {
-	// 		log.Printf("[JobConsumer] Channel closed unexpectedly: %v", chanErr)
-	// 		jc.done <- chanErr
-	// 	}
-	// }()
 
 	deliveries, err := jc.channel.Consume(
 		jc.cfg.Factcheck_Queue_Name, // queue
@@ -351,22 +319,6 @@ func (jc *JobConsumer) StartConsuming(ctx context.Context) {
 				}
 			}
 			return
-
-		// case err := <-jc.notifyChanClose:
-		// 	log.Printf("[JobConsumer] Channel closed event received via notify: %v.", err)
-		// 	if !jc.isStopping {
-		// 		if jc.conn == nil || jc.conn.IsClosed() {
-		// 			log.Println("[JobConsumer] Connection also appears closed. Reconnect will handle.")
-		// 			// The notifyConnClose handler should ideally manage full reconnection.
-		// 			// If it doesn't, the next message delivery attempt will fail, triggering the !ok case.
-		// 		} else {
-		// 			log.Println("[JobConsumer] Channel closed, but connection seems alive. Attempting to re-establish channel and consumer.")
-		// 			if reconnErr := jc.handleReconnect(ctx); reconnErr != nil {
-		// 				log.Printf("[JobConsumer] FATAL: Reconnect failed after channel close: %v. Consumer stopping.", reconnErr)
-		// 			}
-		// 		}
-		// 	}
-		// 	return
 
 		case <-jc.done: // if stop() was called or connetion/channel error
 			log.Printf("[JobConsumer] Stop signal received. Exiting consumer.")

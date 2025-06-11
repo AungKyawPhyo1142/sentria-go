@@ -7,11 +7,11 @@ import (
 )
 
 type Config struct {
-	ServerPort           int
-	GinMode              string
-	RabbitMQ_URL         string
-	Factcheck_Queue_Name string
-
+	ServerPort                  int
+	GinMode                     string
+	RabbitMQ_URL                string
+	Factcheck_Queue_Name        string
+	Factcheck_Result_Queue_Name string
 	// add other configs here
 	// JobQueuesAddress string
 	// NodeAPIBaseURL   string
@@ -45,11 +45,18 @@ func LoadConfig() (*Config, error) {
 		log.Printf("Warning: FACTCHECK_QUEUE_NAME not set, using default: %s", queueName)
 	}
 
+	factcheckResultQueueName := os.Getenv("FACTCHECK_RESULT_QUEUE_NAME")
+	if factcheckResultQueueName == "" {
+		factcheckResultQueueName = "sentria_factcheck_results"
+		log.Printf("Warning: FACTCHECK_RESULT_QUEUE_NAME not set, using default: %s", factcheckResultQueueName)
+	}
+
 	return &Config{
-		ServerPort:           port,
-		GinMode:              ginMode,
-		RabbitMQ_URL:         rabbitURL,
-		Factcheck_Queue_Name: queueName,
+		ServerPort:                  port,
+		GinMode:                     ginMode,
+		RabbitMQ_URL:                rabbitURL,
+		Factcheck_Queue_Name:        queueName,
+		Factcheck_Result_Queue_Name: factcheckResultQueueName,
 	}, nil
 
 }

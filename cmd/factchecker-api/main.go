@@ -179,7 +179,7 @@ func testGDACSFactCheckFromFile() {
 
 	for i, reportData := range reportsToTest {
 		log.Printf("\n===== PROCESSING TEST CASE %d/%d: '%s' (Type: %s) =====",
-			i+1, len(reportsToTest), reportData.Title, reportData.IncidentType)
+			i+1, len(reportsToTest), reportData.ReportName, reportData.IncidentType)
 
 		// Create a per-test-case context if needed, or use parentCtx
 		// For simplicity, using parentCtx. If one API call hangs long, it might affect others.
@@ -191,7 +191,7 @@ func testGDACSFactCheckFromFile() {
 		// individualCancel() // Call if using individual contexts
 
 		if serviceErr != nil {
-			log.Printf("  ERROR during VerifyReportWithGDACS for report '%s': %v", reportData.Title, serviceErr)
+			log.Printf("  ERROR during VerifyReportWithGDACS for report '%s': %v", reportData.ReportName, serviceErr)
 			// Check if context error (timeout or cancellation)
 			if parentCtx.Err() != nil {
 				log.Printf("  Parent context error: %v. Aborting further tests.", parentCtx.Err())
@@ -217,9 +217,9 @@ func testGDACSFactCheckFromFile() {
 				log.Println("  No specific corroborating evidence found by GDACS based on criteria for this report.")
 			}
 		} else {
-			log.Printf("  VerifyReportWithGDACS returned a nil result without a service error for report '%s'. This should be investigated.", reportData.Title)
+			log.Printf("  VerifyReportWithGDACS returned a nil result without a service error for report '%s'. This should be investigated.", reportData.ReportName)
 		}
-		log.Printf("===== COMPLETED TEST CASE %d/%d: '%s' =====", i+1, len(reportsToTest), reportData.Title)
+		log.Printf("===== COMPLETED TEST CASE %d/%d: '%s' =====", i+1, len(reportsToTest), reportData.ReportName)
 
 		// Optional: Add a small delay between processing test cases if you're hitting APIs rapidly
 		// time.Sleep(1 * time.Second)
